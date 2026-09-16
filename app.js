@@ -304,7 +304,9 @@ async function runAudit(url, host, jobId, activePhase) {
   }
 
   const [http, tlsInfo, dnsInfo, exposure] = await Promise.all([
-    withTimeout(inspectHttp(url), 20000, { error: 'timeout HTTP' }),
+    // 40s au lieu de 20s : laisse la place à la 2e tentative + backoff de
+    // inspectHttp quand la 1re est bloquée par une protection anti-bot.
+    withTimeout(inspectHttp(url), 40000, { error: 'timeout HTTP' }),
     withTimeout(inspectTls(host), 12000, { error: 'timeout TLS' }),
     withTimeout(inspectDns(host), 15000, { error: 'timeout DNS' }),
     withTimeout(inspectExposure(url), 30000, { error: 'timeout exposition' }),
@@ -371,9 +373,20 @@ async function runAudit(url, host, jobId, activePhase) {
     : { grade: null, value: null };
 
   const score = scoreFindings(findings);
-  // Audit partiel : si les en-têtes n'ont pas pu être lus, la note globale ne
-  // reflète que TLS/DNS/exposition — on le dit au lieu d'afficher un faux « A ».
+  // Audit partiel : si les en-têtes n'ont pas pu être lus (même après le
+  // retry de inspectHttp), la note globale ne reflète que TLS/DNS/exposition.
+  // Un blocage anti-bot n'est pas une preuve de bonne posture : sans ce
+  // plafond, l'absence de pénalité en-têtes (jusqu'à -84 pts sur le barème,
+  // cf. gradeHeaders) pouvait faire remonter une cible bloquée jusqu'à A
+  // alors qu'un scan complet du même site l'aurait notée D/E. On borne donc
+  // la note à « C » tant que les en-têtes ne sont pas vérifiés — jamais
+  // meilleure que ce qu'un audit incomplet peut honnêtement garantir.
   score.partial = !headersMeasurable;
+  if (score.partial) {
+    const HEADERS_UNKNOWN_CAP = 69; // haut de la bande C (gradeFromValue)
+    score.value = Math.min(score.value, HEADERS_UNKNOWN_CAP);
+    score.grade = gradeFromValue(score.value);
+  }
   const finalUrl = (http && http.finalUrl) || url.toString();
 
   const report = {
@@ -436,7 +449,7 @@ async function fetchOnce(target, redirect) {
   }
 }
 
-async function inspectHttp(url) {
+async function inspectHttpAttempt(url) {
   const chain = [];
   let current = url.toString();
   let res = null;
@@ -501,6 +514,25 @@ async function inspectHttp(url) {
     blocked,
     blockedBy: blocked ? headers['server'] || `HTTP ${res.status}` : null,
   };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Un challenge anti-bot est souvent transitoire (rate-limit ponctuel,
+// fingerprint du burst de inspectExposure sur un job précédent) : une
+// deuxième tentative après un court backoff récupère l'en-tête réel dans
+// une bonne partie des cas, au lieu de se résigner tout de suite à noter en
+// aveugle sur TLS/DNS/exposition seuls (voir scoreFindings / score.partial).
+const HEADERS_BLOCKED_RETRY_DELAY_MS = 2500;
+
+async function inspectHttp(url) {
+  const first = await inspectHttpAttempt(url);
+  if (!first.blocked) return first;
+  await sleep(HEADERS_BLOCKED_RETRY_DELAY_MS + Math.floor(Math.random() * 1000));
+  const retry = await inspectHttpAttempt(url);
+  return retry;
 }
 
 // --- TLS inspection --------------------------------------------------
