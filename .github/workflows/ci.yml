@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: audit-orchestrator:ci
+  # Trivy 0.74.0, épinglé par digest (comme les images de base des Dockerfile).
+  TRIVY: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build de l'image
+        run: docker build -t "$IMAGE" .
+
+      - name: Démarrage avec le durcissement de prod
+        # Mêmes contraintes que le docker-compose du NAS : rootfs en lecture
+        # seule, aucune capability, /tmp en noexec. Token factice : aucun secret.
+        run: |
+          docker run -d --name smoke \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            -e INTERNAL_API_TOKEN=ci-test-token \
+            -p 127.0.0.1:4003:4003 "$IMAGE"
+
+      - name: HEALTHCHECK Docker
+        run: |
+          for _ in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' smoke)
+            echo "health: $status"
+            [ "$status" = healthy ] && exit 0
+            sleep 3
+          done
+          docker logs smoke
+          exit 1
+
+      - name: /health répond 200
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4003/health)
+          test "$code" = 200
+
+      - name: /api/audit refuse sans token (401)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'content-type: application/json' -d '{"target":"example.com"}' \
+            http://127.0.0.1:4003/api/audit)
+          test "$code" = 401
+
+      - name: Avec token, la cible invalide est rejetée par la validation (400)
+        # Reste déterministe : n'envoie aucune requête vers Internet.
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'x-internal-token: ci-test-token' -H 'content-type: application/json' \
+            -d '{}' http://127.0.0.1:4003/api/audit)
+          test "$code" = 400
+
+      - name: Logs du conteneur (en cas d'échec)
+        if: failure()
+        run: docker logs smoke
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Dépendances, secrets et Dockerfile (bloquant)
+        run: |
+          docker run --rm -v "$PWD":/src "$TRIVY" fs \
+            --scanners vuln,secret,misconfig --severity HIGH,CRITICAL \
+            --skip-dirs node_modules --exit-code 1 /src
+
+      - name: Build de l'image
+        run: docker build -t "$IMAGE" .
+
+      - name: Paquets OS de l'image (bloquant, correctifs disponibles)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY" image \
+            --pkg-types os --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE"
+
+      - name: npm intégré à l'image de base (informatif)
+        # Ces paquets sont ceux de l'outil npm livré dans node:22-slim, pas ceux
+        # de l'app ; ils se corrigent en changeant l'image de base. Non bloquant.
+        continue-on-error: true
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY" image \
+            --pkg-types library --severity HIGH,CRITICAL --ignore-unfixed "$IMAGE"
