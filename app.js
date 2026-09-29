@@ -43,6 +43,9 @@ const PORT = Number(process.env.PORT || 4003);
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+// Modèle de secours : utilisé après 1 échec transitoire (503 « overloaded »…)
+// sur le modèle principal.
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   'https://cyberlab-audit-proxy.axelginepro.workers.dev')
   .split(',')
@@ -1657,6 +1660,15 @@ Règles absolues :
 - Ne parle que de ce qui est dans les findings. Si un domaine n'a aucun finding, dis qu'il est correct.
 - Langage clair, orienté impact métier (confiance client, conformité RGPD, risque d'usurpation, interruption de service).
 - Le plan de remédiation est priorisé (1 = le plus urgent), avec un effort réaliste.
+
+Forme attendue (soignée, aérée, développée mais sans remplissage) :
+- executiveSummary : 3 paragraphes courts séparés par une ligne vide (\n\n), 60 à 120 mots chacun.
+  1) Verdict global : la note, ce que cela signifie concrètement pour l'organisation.
+  2) Points positifs : ce qui est déjà bien en place (si rien, le dire honnêtement en une phrase).
+  3) Priorités : les 2 ou 3 sujets les plus importants à traiter en premier et pourquoi.
+- businessRisks : 4 à 6 éléments (moins s'il y a peu de constats). Chaque élément commence par un titre court (5 mots max), puis « : », puis 1 à 2 phrases sur l'impact concret (client, juridique, financier, réputation) et la façon dont la faille serait exploitée. Ex. « Usurpation d'e-mail : sans DMARC strict, un tiers peut envoyer des messages au nom du domaine. »
+- remediationPlan : 4 à 8 actions. action = une phrase à l'impératif, précise et actionnable ; rationale = 1 à 2 phrases (ce que ça corrige, le bénéfice attendu). Regroupe les constats voisins en une seule action.
+- Pas de markdown (ni **, ni #, ni listes à puces) : du texte brut uniquement.
 - Réponds en français.`;
 
 async function buildAiNarrative(report) {
@@ -1696,18 +1708,19 @@ async function buildAiNarrative(report) {
   };
   // Gemini renvoie fréquemment 429 (quota) ou 5xx (« model overloaded »)
   // de façon transitoire : on retente jusqu'à 3 fois avec un backoff.
-  const TRANSIENT = new Set([429, 500, 502, 503, 504]);
+  const TRANSIENT = new Set([404, 429, 500, 502, 503, 504]);
   let lastFail = { available: false, reason: 'Gemini injoignable' };
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     if (attempt > 0) {
-      await new Promise((res) => setTimeout(res, 1500 * attempt));
+      await new Promise((res) => setTimeout(res, 2000 * attempt));
     }
+    const model = attempt < 1 ? GEMINI_MODEL : GEMINI_FALLBACK_MODEL;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 25000);
     try {
       const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-          GEMINI_MODEL,
+          model,
         )}:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: 'POST',
@@ -1742,7 +1755,7 @@ async function buildAiNarrative(report) {
       const parsed = JSON.parse(text);
       return {
         available: true,
-        model: GEMINI_MODEL,
+        model,
         executiveSummary: parsed.executiveSummary,
         businessRisks: parsed.businessRisks || [],
         remediationPlan: parsed.remediationPlan || [],
