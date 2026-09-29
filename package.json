@@ -4,10 +4,16 @@
   "description": "Cyberlab — passive external posture audit + Gemini report layer",
   "main": "app.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node app.js",
+    "lint": "eslint ."
   },
   "dependencies": {
     "express": "^4.18.2",
     "express-rate-limit": "^8.6.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^16.5.0"
   }
 }
