@@ -10,12 +10,14 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Sur main, on ne coupe jamais un run en cours (évite un publish interrompu).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE: audit-orchestrator:ci
   # Trivy 0.74.0, épinglé par digest (comme les images de base des Dockerfile).
   TRIVY: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+  COSIGN: gcr.io/projectsigstore/cosign@sha256:9e5c2f2edc34351160407ca3416c61855bdf9403c3c5936e0f0be7fc261611b8
 
 jobs:
   lint:
@@ -108,3 +110,47 @@ jobs:
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY" image \
             --pkg-types library --severity HIGH,CRITICAL --ignore-unfixed "$IMAGE"
+
+  # Publie l'image validée : uniquement sur push main, une fois les 3 gates verts.
+  # Ne déploie rien : le déploiement reste géré par le pipeline Ansible du repo
+  # HomeServer-monitoring, qui référence l'image par digest.
+  publish:
+    needs: [lint, build-and-smoke-test, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push sur GHCR
+      id-token: write   # signature Cosign sans clé (OIDC GitHub)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Login GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build et push (tag = SHA du commit)
+        run: |
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker build -t "$REPO:${{ github.sha }}" .
+          docker push "$REPO:${{ github.sha }}"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$REPO:${{ github.sha }}")
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+
+      - name: Signature Cosign (sans clé, via OIDC)
+        run: |
+          docker run --rm \
+            -e ACTIONS_ID_TOKEN_REQUEST_URL \
+            -e ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            -e DOCKER_CONFIG=/dockercfg \
+            -v "$HOME/.docker":/dockercfg:ro \
+            "$COSIGN" sign --yes "$DIGEST"
+
+      - name: Digest à reporter dans le compose
+        run: |
+          {
+            echo "### Image publiée et signée"
+            echo
+            echo "\`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
