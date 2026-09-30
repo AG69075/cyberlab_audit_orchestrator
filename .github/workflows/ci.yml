@@ -154,3 +154,32 @@ jobs:
             echo
             echo "\`$DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      # A ajouter a la fin du job publish de chaque backend (meme bloc partout).
+      # Ouvre une PR sur HomeServer-monitoring qui remplace le digest dans le
+      # compose. Secret requis dans le depot backend : MONITORING_REPO_TOKEN
+      # (PAT fine-grained limite a HomeServer-monitoring : Contents + Pull requests en ecriture).
+      - name: PR de bump du digest dans HomeServer-monitoring
+        env:
+          GH_TOKEN: ${{ secrets.MONITORING_REPO_TOKEN }}
+          TARGET: NAS-HomeServer/HomeServer-monitoring
+        run: |
+          set -euo pipefail
+          NAME="${GITHUB_REPOSITORY##*/}"
+          BASE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          BRANCH="bump/${NAME}-${GITHUB_SHA::7}"
+          gh auth setup-git
+          gh repo clone "$TARGET" monitoring -- --depth 1
+          cd monitoring
+          sed -i -E "s|${BASE}@sha256:[a-f0-9]{64}|${DIGEST}|" cyberlab/docker-compose.yml
+          if git diff --quiet; then
+            echo "Digest deja a jour, rien a faire."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "deploy: ${NAME} -> ${GITHUB_SHA::7} (image signee)"
+          git push origin "$BRANCH"
+          gh pr create --repo "$TARGET" --base main --head "$BRANCH" \
+            --title "deploy: ${NAME} -> ${GITHUB_SHA::7}" \
+            --body "Nouvelle image signee : \`${DIGEST}\`. Source : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
