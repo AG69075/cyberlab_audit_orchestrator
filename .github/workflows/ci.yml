@@ -113,7 +113,7 @@ jobs:
 
   # Publie l'image validée : uniquement sur push main, une fois les 3 gates verts.
   # Ne déploie rien : le déploiement reste géré par le pipeline Ansible du repo
-  # HomeServer-monitoring, qui référence l'image par digest.
+  # Cyberlab_backends, qui référence l'image par digest.
   publish:
     needs: [lint, build-and-smoke-test, security]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -155,21 +155,21 @@ jobs:
             echo "\`$DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
       # A ajouter a la fin du job publish de chaque backend (meme bloc partout).
-      # Ouvre une PR sur HomeServer-monitoring qui remplace le digest dans le
-      # compose. Secret requis dans le depot backend : MONITORING_REPO_TOKEN
-      # (PAT fine-grained limite a HomeServer-monitoring : Contents + Pull requests en ecriture).
-      - name: PR de bump du digest dans HomeServer-monitoring
+      # Ouvre une PR sur Cyberlab_backends qui remplace le digest dans le
+      # compose. Secret requis dans le depot backend : CYBERLAB_BACKENDS_TOKEN
+      # (PAT fine-grained limite a Cyberlab_backends : Contents + Pull requests en ecriture).
+      - name: PR de bump du digest dans Cyberlab_backends
         env:
-          GH_TOKEN: ${{ secrets.MONITORING_REPO_TOKEN }}
-          TARGET: NAS-HomeServer/HomeServer-monitoring
+          GH_TOKEN: ${{ secrets.CYBERLAB_BACKENDS_TOKEN }}
+          TARGET: NAS-HomeServer/Cyberlab_backends
         run: |
           set -euo pipefail
           NAME="${GITHUB_REPOSITORY##*/}"
           BASE="ghcr.io/${GITHUB_REPOSITORY,,}"
           BRANCH="bump/${NAME}-${GITHUB_SHA::7}"
           gh auth setup-git
-          gh repo clone "$TARGET" monitoring -- --depth 1
-          cd monitoring
+          gh repo clone "$TARGET" backends -- --depth 1
+          cd backends
           sed -i -E "s|${BASE}@sha256:[a-f0-9]{64}|${DIGEST}|" cyberlab/docker-compose.yml
           if git diff --quiet; then
             echo "Digest deja a jour, rien a faire."
